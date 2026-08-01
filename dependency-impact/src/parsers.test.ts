@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseDependencyChanges, getImportPatterns } from "./parsers";
+import { parseDependencyChanges, getImportPatterns, classifyUpgrade, findDepLineInPatch, extractDependabotSection } from "./parsers";
 
 describe("parseDependencyChanges", () => {
   describe("terraform", () => {
@@ -403,5 +403,159 @@ describe("getImportPatterns", () => {
 
       expect(patterns).toContain("some-package");
     });
+  });
+});
+
+describe("classifyUpgrade", () => {
+  it("detects major upgrades", () => {
+    expect(classifyUpgrade("1.6.0", "2.0.0")).toBe("major");
+    expect(classifyUpgrade("6.3", "7.0")).toBe("major");
+  });
+
+  it("detects minor upgrades", () => {
+    expect(classifyUpgrade("5.31.0", "5.32.0")).toBe("minor");
+    expect(classifyUpgrade("1.9.0", "1.10.0")).toBe("minor");
+  });
+
+  it("detects patch upgrades", () => {
+    expect(classifyUpgrade("5.31.0", "5.31.1")).toBe("patch");
+    expect(classifyUpgrade("7.5.0", "7.5.3")).toBe("patch");
+  });
+
+  it("returns unknown for non-semver strings", () => {
+    expect(classifyUpgrade("abc", "def")).toBe("unknown");
+  });
+
+  it("treats 0.x minor bumps as major", () => {
+    expect(classifyUpgrade("0.4.0", "0.5.0")).toBe("major");
+    expect(classifyUpgrade("0.1.0", "0.2.0")).toBe("major");
+  });
+
+  it("treats 0.x patch bumps as patch", () => {
+    expect(classifyUpgrade("0.4.0", "0.4.1")).toBe("patch");
+  });
+
+  it("handles two-segment versions", () => {
+    expect(classifyUpgrade("1.0", "1.1")).toBe("minor");
+    expect(classifyUpgrade("1.0", "2.0")).toBe("major");
+  });
+});
+
+describe("findDepLineInPatch", () => {
+  it("finds the line number for an added dependency", () => {
+    const patch = [
+      `@@ -10,3 +10,3 @@`,
+      `     "lodash": "^4.17.0",`,
+      `-    "axios": "^1.6.0"`,
+      `+    "axios": "^2.0.0"`,
+    ].join("\n");
+
+    expect(findDepLineInPatch(patch, "axios")).toBe(11);
+  });
+
+  it("returns null when dependency is not in an added line", () => {
+    const patch = [
+      `@@ -10,3 +10,3 @@`,
+      `     "lodash": "^4.17.0",`,
+      `     "axios": "^1.6.0"`,
+    ].join("\n");
+
+    expect(findDepLineInPatch(patch, "axios")).toBeNull();
+  });
+
+  it("handles multiple hunks", () => {
+    const patch = [
+      `@@ -1,3 +1,3 @@`,
+      `     "a": "1.0.0",`,
+      `@@ -20,3 +20,3 @@`,
+      `     "b": "2.0.0",`,
+      `-    "target": "^1.0.0"`,
+      `+    "target": "^2.0.0"`,
+    ].join("\n");
+
+    expect(findDepLineInPatch(patch, "target")).toBe(21);
+  });
+
+  it("does not match a dep name that is a prefix of another dep name", () => {
+    const patch = [
+      `@@ -10,3 +10,3 @@`,
+      `-    "aws-sdk": "^2.0.0"`,
+      `+    "aws-sdk": "^3.0.0"`,
+    ].join("\n");
+
+    expect(findDepLineInPatch(patch, "aws")).toBeNull();
+  });
+
+  it("skips the no-newline-at-end-of-file marker when counting lines", () => {
+    const patch = [
+      `@@ -10,3 +10,3 @@`,
+      `     "lodash": "^4.17.0",`,
+      `-    "axios": "^1.6.0"`,
+      `\\ No newline at end of file`,
+      `+    "axios": "^2.0.0"`,
+    ].join("\n");
+
+    expect(findDepLineInPatch(patch, "axios")).toBe(11);
+  });
+});
+
+describe("extractDependabotSection", () => {
+  const groupBody = [
+    "Bumps the deps group with 2 updates.",
+    "",
+    '<details><summary>Release notes for axios</summary>',
+    "<p>Release v2.0.0 - Breaking changes</p>",
+    "</details>",
+    "",
+    '<details><summary>Release notes for lodash</summary>',
+    "<p>v4.17.21 - Security fix</p>",
+    "</details>",
+  ].join("\n");
+
+  it("extracts only the matching details block for a dependency", () => {
+    const section = extractDependabotSection(groupBody, "axios");
+    expect(section).toContain("axios");
+    expect(section).toContain("Release v2.0.0");
+    expect(section).not.toContain("lodash");
+  });
+
+  it("extracts the other dependency independently", () => {
+    const section = extractDependabotSection(groupBody, "lodash");
+    expect(section).toContain("lodash");
+    expect(section).toContain("Security fix");
+    expect(section).not.toContain("axios");
+  });
+
+  it("returns the full body when no details blocks exist", () => {
+    const plain = "Just a simple PR body with no HTML blocks.";
+    expect(extractDependabotSection(plain, "axios")).toBe(plain);
+  });
+
+  it("returns the full body when no details block mentions the dep", () => {
+    const unrelated = [
+      "<details><summary>Notes for react</summary>",
+      "<p>Some react notes</p>",
+      "</details>",
+    ].join("\n");
+    expect(extractDependabotSection(unrelated, "axios")).toBe(unrelated);
+  });
+
+  it("returns multiple matching blocks if dep appears in more than one", () => {
+    const body = [
+      '<details><summary>Release notes for axios</summary>',
+      "<p>Release notes here</p>",
+      "</details>",
+      '<details><summary>Changelog for axios</summary>',
+      "<p>Changelog entries</p>",
+      "</details>",
+      '<details><summary>Commits for lodash</summary>',
+      "<p>Commit list</p>",
+      "</details>",
+    ].join("\n");
+
+    const section = extractDependabotSection(body, "axios");
+    expect(section).toContain("Release notes here");
+    expect(section).toContain("Changelog entries");
+    expect(section).not.toContain("lodash");
   });
 });

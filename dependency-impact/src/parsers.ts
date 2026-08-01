@@ -149,6 +149,62 @@ export function parseDependencyChanges(diff: string, files: { filename: string; 
   return changes;
 }
 
+import { UpgradeType } from "./types";
+
+/**
+ * Classify a version change as major, minor, patch, or unknown.
+ */
+export function classifyUpgrade(from: string, to: string): UpgradeType {
+  const parseSemver = (v: string): [number, number, number] | null => {
+    const match = v.match(/^(\d+)(?:\.(\d+))?(?:\.(\d+))?/);
+    if (!match) return null;
+    return [
+      parseInt(match[1], 10),
+      parseInt(match[2] ?? "0", 10),
+      parseInt(match[3] ?? "0", 10),
+    ];
+  };
+
+  const fromParts = parseSemver(from);
+  const toParts = parseSemver(to);
+  if (!fromParts || !toParts) return "unknown";
+
+  if (toParts[0] !== fromParts[0]) return "major";
+  // In 0.x packages, minor bumps carry the same breaking-change risk as a
+  // major bump (semver allows breaking changes throughout 0.y.z).
+  if (fromParts[0] === 0 && toParts[1] !== fromParts[1]) return "major";
+  if (toParts[1] !== fromParts[1]) return "minor";
+  return "patch";
+}
+
+/**
+ * Find the line number in the new file where a dependency's version appears as
+ * an added line in a diff patch. Returns null if not found.
+ */
+export function findDepLineInPatch(patch: string, depName: string): number | null {
+  let lineNum = 0;
+  const escaped = depName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // Require exact word boundary: dep name must not be preceded or followed by
+  // a character that is valid in a package name (alphanumeric, _, ., /, @, -)
+  // so that e.g. "aws" does not match "aws-sdk".
+  const depPattern = new RegExp(`(?<![\\w./@\\-])${escaped}(?![\\w./@\\-])`);
+
+  for (const raw of patch.split("\n")) {
+    const hunkMatch = raw.match(/^@@ -\d+(?:,\d+)? \+(\d+)/);
+    if (hunkMatch) {
+      lineNum = parseInt(hunkMatch[1], 10) - 1;
+      continue;
+    }
+    // Skip removed lines and the "\ No newline at end of file" diff marker
+    if (raw.startsWith("-") || raw.startsWith("\\")) continue;
+    lineNum++;
+    if (raw.startsWith("+") && depPattern.test(raw)) {
+      return lineNum;
+    }
+  }
+  return null;
+}
+
 export function getImportPatterns(depName: string, ecosystem: string): string[] {
   switch (ecosystem) {
     case "npm":
@@ -186,4 +242,28 @@ export function getImportPatterns(depName: string, ecosystem: string): string[] 
     default:
       return [depName];
   }
+}
+
+/**
+ * Extract the section of a Dependabot PR body relevant to a specific dependency.
+ *
+ * Dependabot group PRs embed per-dependency release notes inside `<details>`
+ * blocks whose content mentions the package name.  This function returns only
+ * the matching block(s) instead of the full body, avoiding token duplication
+ * when the body is attached to every dependency.
+ *
+ * Falls back to the full body when no per-dep section can be isolated (e.g.
+ * single-dependency Dependabot PRs where the whole body is relevant).
+ */
+export function extractDependabotSection(body: string, depName: string): string {
+  // Match all <details>…</details> blocks (non-greedy, case-insensitive tags)
+  const detailsBlocks = body.match(/<details[\s\S]*?<\/details>/gi);
+  if (!detailsBlocks || detailsBlocks.length === 0) return body;
+
+  const escaped = depName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const depBoundaryRe = new RegExp(`(?<![\\w./@\\-])${escaped}(?![\\w./@\\-])`);
+  const matching = detailsBlocks.filter((block) => depBoundaryRe.test(block));
+  if (matching.length === 0) return body;
+
+  return matching.join("\n\n");
 }
