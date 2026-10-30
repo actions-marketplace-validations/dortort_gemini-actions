@@ -16,7 +16,7 @@
     "test": "npm run test --workspaces --if-present"
   },
   "devDependencies": {
-    "@types/node": "^20.17.0",
+    "@types/node": "^26.6.5",
     "@vercel/ncc": "^0.38.3",
     "nx": "^22.5.0",
     "typescript": "^5.7.0",
